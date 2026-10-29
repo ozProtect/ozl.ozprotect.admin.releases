@@ -23,4 +23,5 @@ to this repository. No personal GitHub token or frontend checkout is published.
 
 macOS Intel/Apple Silicon and Linux x64/ARM64 builds are prepared as an opt-in
 workflow matrix. Their native acceptance and updater installation are future work;
-they are not part of the initial public Windows update feed.
+they are not part of the initial public Windows update feed. This matrix defaults
+to disabled and performs build checks only, with no package artifact uploads.
