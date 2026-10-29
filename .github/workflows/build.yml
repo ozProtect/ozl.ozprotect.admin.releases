@@ -1,0 +1,206 @@
+name: Build signed desktop release
+
+on:
+  push:
+    branches: [main]
+    paths: [build-request.json]
+  workflow_dispatch:
+    inputs:
+      future_platforms:
+        description: 'Build future macOS/Linux packages (native acceptance required before public distribution)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-public-release
+  cancel-in-progress: false
+
+jobs:
+  request:
+    if: github.repository == 'ozProtect/ozl.ozprotect.admin.releases' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source: ${{ steps.request.outputs.source }}
+      version: ${{ steps.request.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate metadata-only request
+        id: request
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const request = JSON.parse(fs.readFileSync('build-request.json', 'utf8'));
+          if (request.schema !== 1 || request.channel !== 'prod' || !/^[a-f0-9]{40}$/.test(request.source)
+              || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(request.version)
+              || Object.keys(request).some(k => !['schema', 'channel', 'source', 'version'].includes(k))) throw Error('Invalid build request');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `source=${request.source}\nversion=${request.version}\n`);
+          NODE
+
+  windows:
+    needs: request
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      npm_config_cache: ${{ github.workspace }}/QA/npm-cache
+      ELECTRON_CACHE: ${{ github.workspace }}/QA/electron-cache
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/QA/builder-cache
+      OZPROTECT_BUILD_DIR: ${{ github.workspace }}/QA/packages
+      OZPROTECT_RELEASE_VERSION: ${{ needs.request.outputs.version }}
+      OZPROTECT_SOURCE_SHA: ${{ needs.request.outputs.source }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Mint a short-lived read-only token for only the private wrapper source
+        id: source-access
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ozProtect
+          repositories: ozl.ozprotect.admin
+          permission-contents: read
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ozProtect/ozl.ozprotect.admin
+          ref: prod
+          token: ${{ steps.source-access.outputs.token }}
+          submodules: false
+          persist-credentials: false
+          path: source
+      - name: Require the requested SHA to match the approved prod head
+        shell: pwsh
+        run: |
+          $actual = git -C source rev-parse HEAD
+          if ($actual -ne $env:OZPROTECT_SOURCE_SHA) { throw 'Requested source is not the current approved prod head' }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - run: npm ci
+        working-directory: source
+      - run: npm run check
+        working-directory: source
+      - run: npm test
+        working-directory: source
+      - run: npm run release:version
+        working-directory: source
+      - run: npm run package -- --win --x64
+        working-directory: source
+      - name: Sign update metadata
+        working-directory: source
+        env:
+          UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+        run: npm run release:manifest -- "$env:OZPROTECT_BUILD_DIR"
+      - name: Publish only binary packages and signed update metadata
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.request.outputs.version }}
+        shell: pwsh
+        run: |
+          $repo = 'ozProtect/ozl.ozprotect.admin.releases'
+          $tag = 'v' + $env:RELEASE_VERSION
+          gh release view $tag --repo $repo --json isDraft --jq .isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) { throw 'Release already exists; use a new prod run instead of replacing it' }
+          $notes = "Windows installer and portable. Private source: $env:OZPROTECT_SOURCE_SHA. Update metadata is Ed25519-signed."
+          gh release create $tag --repo $repo --target $env:GITHUB_SHA --draft --title "ozProtect Admin $env:RELEASE_VERSION" --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create draft release' }
+          $files = Get-ChildItem -LiteralPath $env:OZPROTECT_BUILD_DIR -File | Where-Object { $_.Name -match '(^ozProtect-Admin-[0-9.]+-win-x64-(setup|portable)\.exe(\.blockmap)?$)|(^update\.json(\.sig)?$)' }
+          if ($files.Count -lt 4) { throw 'Missing signed release artifacts' }
+          foreach ($file in $files) {
+            gh release upload $tag $file.FullName --repo $repo
+            if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; draft remains unpublished' }
+          }
+          gh release edit $tag --repo $repo --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot publish complete release' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-binaries
+          path: |
+            QA/packages/*-setup.exe
+            QA/packages/*-portable.exe
+            QA/packages/update.json
+            QA/packages/update.json.sig
+          if-no-files-found: error
+          retention-days: 14
+
+  future-platforms:
+    needs: request
+    if: github.event_name == 'workflow_dispatch' && inputs.future_platforms == true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: mac
+            arch: x64
+          - runner: macos-15
+            target: mac
+            arch: arm64
+          - runner: ubuntu-24.04
+            target: linux
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            target: linux
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      npm_config_cache: ${{ github.workspace }}/QA/npm-cache
+      ELECTRON_CACHE: ${{ github.workspace }}/QA/electron-cache
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/QA/builder-cache
+      OZPROTECT_BUILD_DIR: ${{ github.workspace }}/QA/packages
+      OZPROTECT_RELEASE_VERSION: ${{ needs.request.outputs.version }}
+      OZPROTECT_SOURCE_SHA: ${{ needs.request.outputs.source }}
+      CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Mint a short-lived read-only token for only the private wrapper source
+        id: source-access
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ozProtect
+          repositories: ozl.ozprotect.admin
+          permission-contents: read
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ozProtect/ozl.ozprotect.admin
+          ref: prod
+          token: ${{ steps.source-access.outputs.token }}
+          submodules: false
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - run: npm ci
+        working-directory: source
+      - run: npm run release:version
+        working-directory: source
+      - name: Require signed and notarized macOS packages
+        if: matrix.target == 'mac'
+        shell: bash
+        run: test -n "$CSC_LINK" && test -n "$CSC_KEY_PASSWORD" && test -n "$APPLE_ID" && test -n "$APPLE_APP_SPECIFIC_PASSWORD" && test -n "$APPLE_TEAM_ID"
+      - run: npm run package -- --${{ matrix.target }} --${{ matrix.arch }}
+        working-directory: source
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: future-${{ matrix.target }}-${{ matrix.arch }}
+          path: |
+            QA/packages/*.dmg
+            QA/packages/*.zip
+            QA/packages/*.AppImage
+            QA/packages/*.deb
+          if-no-files-found: error
